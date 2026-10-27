@@ -4,6 +4,9 @@ convention), carrying the boundary conditions. The inner averaging cube is NOT p
 averaging volumes are postprocessing selections, so the mesh does not conform to them.
 
 The DFN comes from a bgem Population (cfg.fractures.stochastic)
+
+The mesh is non-conforming: the fractures are not fragmented with the cube nor with each other,
+so the cube and every fracture are meshed independently.
 """
 import os
 from dataclasses import dataclass
@@ -156,23 +159,19 @@ def _support_spec(half: float) -> List[Tuple[np.ndarray, Dict[str, str]]]:
 
 def make_geometry(factory, cfg_geometry: dotdict, cfg_mesh: dotdict, fracture_set: FractureSet,
                   subc_support: bool = False):
-    # Outer cube + fractures + named boundary sides (+ SUBC support tetrahedra)
+    # Outer cube + named boundary sides (+ SUBC support tetrahedra), fragmented together;
+    # then the fractures, added unfragmented so they are meshed independently of the cube
     # Fractures keep bgem's per-fracture regions -- they must not be
     # joined, because the aperture field is keyed by region id
 
     L_ext = float(cfg_geometry.L_ext_factor) * float(cfg_geometry.L_inner)
     box_dims = [L_ext, L_ext, L_ext]
+    step = float(cfg_mesh.fracture_mesh_step)
 
     box, sides = mesh_tools.box_with_sides(factory, box_dims)  # centered at origin
-    box.set_region(cfg_geometry.bulk_region)
+    # without embedded fractures the cube needs its own size field
+    box.set_region(cfg_geometry.bulk_region).mesh_step(step)
     geometry_set = [box]
-    if len(fracture_set) > 0:
-        fr_shapes, _region_map = fr_mesh.geometry_gmsh(fracture_set, factory)
-        fr_group = fr_shapes.intersect(box).mesh_step(float(cfg_mesh.fracture_mesh_step))
-        geometry_set.append(fr_group)
-    else:
-        print("[upscale_m mesh] WARNING: empty fracture set, mesh has no fracture regions")
-
     n_main = len(geometry_set)
 
     support_spec = _support_spec(L_ext / 2.0) if subc_support else []
@@ -201,6 +200,19 @@ def make_geometry(factory, cfg_geometry: dotdict, cfg_mesh: dotdict, fracture_se
     factory.synchronize()
     factory.remove_duplicate_entities()
     factory.synchronize()
+
+    # fractures only after remove_duplicate_entities, which fragments all entities
+    if len(fracture_set) > 0:
+        fr_shapes, _region_map = fr_mesh.geometry_gmsh(fracture_set, factory)
+        # cut one by one: intersecting the whole group splits the fractures by each other
+        cut_box = factory.box(box_dims)
+        fractures = [fr.intersect(cut_box) for fr in fr_shapes.split_by_region()]
+        fr_group = factory.group(*[fr for fr in fractures if fr.dim_tags]).mesh_step(step)
+        geometry_final = factory.group(geometry_final, fr_group)
+        factory.keep_only(geometry_final)  # drops cut_box
+        factory.synchronize()
+    else:
+        print("[upscale_m mesh] WARNING: empty fracture set, mesh has no fracture regions")
     return geometry_final
 
 
